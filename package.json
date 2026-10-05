@@ -1,0 +1,19 @@
+{
+  "name": "cpsc-3640-dex",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Deploys USDC/TOKEN Uniswap V3 pools (all four fee tiers) on Ethereum Sepolia",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "deploy:dry": "node scripts/deploy-pools.mjs --dry-run",
+    "deploy": "node scripts/deploy-pools.mjs",
+    "deploy:swap": "node scripts/deploy-pools.mjs --swap",
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ethers": "^6.17.0"
+  }
+}
