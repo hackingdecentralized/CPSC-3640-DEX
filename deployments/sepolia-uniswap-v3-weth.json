@@ -1,0 +1,158 @@
+{
+  "chainId": "11155111",
+  "deployers": {
+    "0x6376B9B4ea797E48e0dc9349B2413d47D19d298E": {
+      "pools": {
+        "100": {
+          "fee": 100,
+          "target": "10000/1",
+          "pool": "0xCcFeE4fe6f25a7853f087E08F8ea3816cC4a8592",
+          "tickSpacing": 1,
+          "tickLower": -887272,
+          "tickUpper": 887272,
+          "status": "SUCCESS",
+          "initTx": "0xa7da6d16a0d27c447bd085c730bbf210f7157f6ae9481461e772a86fb4dcdad8",
+          "repriceTxs": [],
+          "wrapTxs": [
+            "0xde34b6afa65cb3aea28b05a045706e30ea884895a239c582c2658fd737c24b7e"
+          ],
+          "approvals": [
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x57e089af839e2e208fbcafa81099fd847c92b14c4fac8de75e081d3f2b74901c"
+            },
+            {
+              "token": "WETH",
+              "spender": "PositionManager",
+              "hash": "0x51719beecd25312cc6a71b65ace8d688d354af015a86fd87cfcd92009ae37055"
+            }
+          ],
+          "mintTx": "0x95b5c67ce548e2d08c0373705c3accdfa90e69a14c8f8a24849044f0f352d833",
+          "swapTx": null,
+          "tokenId": "233212",
+          "deposited0": "1000000000000000000000",
+          "deposited1": "100000000000000000",
+          "depositSource": "mint receipt",
+          "verification": "quote 0.000001 WETH → 0.00999890002099869 BULLDOGS (expected ≈ 0.009999, price impact 0.0019997%)",
+          "notes": [],
+          "updatedAt": "2026-10-05T21:24:12.905Z",
+          "history": []
+        },
+        "500": {
+          "fee": 500,
+          "target": "10000/1",
+          "pool": "0x288d4D5Ef57AAE390453b21b0cFEEEEC6496F83B",
+          "tickSpacing": 10,
+          "tickLower": -887270,
+          "tickUpper": 887270,
+          "status": "SUCCESS",
+          "initTx": "0x9779c800b9e8b1fcf43b23953a515c5a7ff2de8805a7cb835a058ae0471ee600",
+          "repriceTxs": [],
+          "wrapTxs": [
+            "0x453cd9b6959b846c1c9dc5d09196ac6ad7edaf4ea7fa2e0e560ad1f02943bb31"
+          ],
+          "approvals": [
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x6e730ce1c9846daa610c6084f7ee18ed0a7c3be9b6aa0c98b3457120a6d27c22"
+            },
+            {
+              "token": "WETH",
+              "spender": "PositionManager",
+              "hash": "0xe5f1815512f299a6c191a14acfb1c0ac106deda8eb2666481d67de192243ee83"
+            }
+          ],
+          "mintTx": "0x21c018281453fac5750ac52bd687381c5ef45965a57f25d07a343dcc6d875eac",
+          "swapTx": null,
+          "tokenId": "233213",
+          "deposited0": "1000000000000000000000",
+          "deposited1": "100000000000000000",
+          "depositSource": "mint receipt",
+          "verification": "quote 0.000001 WETH → 0.00999490010097349 BULLDOGS (expected ≈ 0.009995, price impact 0.0019989%)",
+          "notes": [],
+          "updatedAt": "2026-10-05T21:25:16.818Z",
+          "history": []
+        },
+        "3000": {
+          "fee": 3000,
+          "target": "10000/1",
+          "pool": "0x70bC0a3dDFf1bAE68A7Ac66eEd847591CC7Ca395",
+          "tickSpacing": 60,
+          "tickLower": -887220,
+          "tickUpper": 887220,
+          "status": "SUCCESS",
+          "initTx": "0xcbeb8541e494bab13d13a09eb14daa97ad115292749d87c8cd1906f8e0050336",
+          "repriceTxs": [],
+          "wrapTxs": [
+            "0xe202d53d5dcd53956f72c72cd188c655b28f86299e5c74cdb5efd7411a9cbce0"
+          ],
+          "approvals": [
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x4eb2a031af55eb6fae2917deedfffb2232b49f0f6c50346f26d0eafd02abe14e"
+            },
+            {
+              "token": "WETH",
+              "spender": "PositionManager",
+              "hash": "0x6bc365f7416252df526393d9cfd5f5a4db5006da84120eac86b3fcb2d53be997"
+            }
+          ],
+          "mintTx": "0x1a6a2a64f41c3186aa42e4a11b3eea08b3f56f47efe3546772c3b6b9482726db",
+          "swapTx": null,
+          "tokenId": "233214",
+          "deposited0": "1000000000000000000000",
+          "deposited1": "100000000000000000",
+          "depositSource": "mint receipt",
+          "verification": "quote 0.000001 WETH → 0.009969900600091017 BULLDOGS (expected ≈ 0.00997, price impact 0.0019939%)",
+          "notes": [],
+          "updatedAt": "2026-10-05T21:26:36.956Z",
+          "history": []
+        },
+        "10000": {
+          "fee": 10000,
+          "target": "10000/1",
+          "pool": "0x16f79e65A5A9A3503b9f78e5e68b1912F72c264c",
+          "tickSpacing": 200,
+          "tickLower": -887200,
+          "tickUpper": 887200,
+          "status": "SUCCESS",
+          "initTx": "0xaba8847864c931594052c63a71c9f8b42cd2298ce5ce9046c1d795b11a233f67",
+          "repriceTxs": [],
+          "wrapTxs": [
+            "0x9db35389eb257794df4d88e7a9b40d699ee8365bbe3ab7f274e9ce7b1433d28c"
+          ],
+          "approvals": [
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0xb98d3826de4caedd5e56f917af5c999d0f83b292c5acaada8dede8724946d1fc"
+            },
+            {
+              "token": "WETH",
+              "spender": "PositionManager",
+              "hash": "0xc9ab32ad90df609efdfb1cf0fbce22bd387d263eb094c4aec93f686245939105"
+            }
+          ],
+          "mintTx": "0x903bc7d4f7dff2caca764d972f544c2cd2de8a95f9ad9cb31433277a8ef7e70d",
+          "swapTx": null,
+          "tokenId": "233215",
+          "deposited0": "1000000000000000000000",
+          "deposited1": "100000000000000000",
+          "depositSource": "mint receipt",
+          "verification": "quote 0.000001 WETH → 0.009899901990970289 BULLDOGS (expected ≈ 0.0099, price impact 0.0019799%)",
+          "notes": [],
+          "updatedAt": "2026-10-05T21:28:05.050Z",
+          "history": []
+        }
+      }
+    }
+  },
+  "quote": "0xfFf9976782d46CC05630D1f6eBAb18b2324d6B14",
+  "token": "0xBc2BEfb9a8aA70AfA23F7451A0794466976B6974",
+  "factory": "0x0227628f3F023bb0B980b67D528571c95c6DaC1c",
+  "positionManager": "0x1238536071E1c677A632429e3655c799b22cDA52",
+  "updatedAt": "2026-10-05T21:28:05.050Z"
+}

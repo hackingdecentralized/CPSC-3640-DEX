@@ -1,0 +1,338 @@
+{
+  "chainId": "11155111",
+  "deployers": {
+    "0x6376B9B4ea797E48e0dc9349B2413d47D19d298E": {
+      "pools": {
+        "100": {
+          "fee": 100,
+          "target": "10/1",
+          "pool": "0x0c6219eEe050EA520c7FFc66292f6C7A8A961002",
+          "tickSpacing": 1,
+          "tickLower": -887272,
+          "tickUpper": 887272,
+          "status": "REPRICED",
+          "initTx": "0x44b9ddc202d9f839822093ab84b21ade843b124399185ff2328982b189bde80b",
+          "repriceTxs": [
+            {
+              "step": "withdraw",
+              "hash": "0xdedf2f3675a49d15c1a916742142dcab42343cef53f6d8cedb670a3239d846b1"
+            },
+            {
+              "step": "move price",
+              "hash": "0xb0823218084049eb86ec076d005f53ed084729b642c32ad5a0f00cce6b0413d7"
+            }
+          ],
+          "approvals": [
+            {
+              "token": "USDC",
+              "spender": "SwapRouter02",
+              "hash": "0x7c01e20154746feebc462ee1fc9643e9201fa66a8eb4e2e08b557573ae491960"
+            },
+            {
+              "token": "USDC",
+              "spender": "PositionManager",
+              "hash": "0x34a4f5cbcf1a64ab5101327726cece19b9ece9aaa282fb8bb9ff4bac6d9c135a"
+            },
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x0a33b3c3df7d25ee52e0e08ef895dcb2fbf33564270cd2433ed8a9fbaa0df95c"
+            }
+          ],
+          "mintTx": "0x1d816d6ba9e3002d8faad9db0099e4471af960676ff520768f405600cbf4fbc1",
+          "swapTx": null,
+          "tokenId": "233204",
+          "deposited0": "50000000",
+          "deposited1": "499999999999996943343",
+          "depositSource": "increaseLiquidity receipt",
+          "verification": "quote 0.001 USDC → 0.009989800424202803 BULLDOGS (expected ≈ 0.009999, price impact 0.0039954%)",
+          "notes": [
+            "withdrew 50.349883 USDC + 993047.105090489449834215 BULLDOGS (incl. fees) to wallet",
+            "repriced from 19722.941285 to 10.0 BULLDOGS/USDC"
+          ],
+          "updatedAt": "2026-10-05T21:01:01.993Z",
+          "history": [
+            {
+              "fee": 100,
+              "pool": "0x0c6219eEe050EA520c7FFc66292f6C7A8A961002",
+              "tickSpacing": 1,
+              "tickLower": -887272,
+              "tickUpper": 887272,
+              "status": "SUCCESS",
+              "initTx": "0x44b9ddc202d9f839822093ab84b21ade843b124399185ff2328982b189bde80b",
+              "approvals": [
+                {
+                  "token": "USDC",
+                  "spender": "PositionManager",
+                  "hash": "0x3cc8eaa2fa9fd230949b36645a9f6e32bba0123e8a9753063585dad8046f9888"
+                },
+                {
+                  "token": "BULLDOGS",
+                  "spender": "PositionManager",
+                  "hash": "0x77317ea55d916100b6dc08fdabda40b02f42f3befc13c7e0ad8ba81b740c2bfc"
+                }
+              ],
+              "mintTx": "0x1897050bf3af5890ea1697deb21f618d284351b0117f64fdd8d7684446028160",
+              "swapTx": null,
+              "tokenId": "233204",
+              "deposited0": "50000000",
+              "deposited1": "999999999999999965491995",
+              "depositSource": "mint receipt",
+              "verification": "quote 0.001 USDC → 19.979600807575864634 BULLDOGS (expected ≈ 19.998, price impact 0.0039958%)",
+              "updatedAt": "2026-10-05T18:56:53.167Z",
+              "target": "20000/1"
+            }
+          ]
+        },
+        "500": {
+          "fee": 500,
+          "target": "10/1",
+          "pool": "0xf49194dD602aF2923Fb149E705Ef006a193a9ddC",
+          "tickSpacing": 10,
+          "tickLower": -887270,
+          "tickUpper": 887270,
+          "status": "REPRICED",
+          "initTx": "0x099fd7e66ac19705dcebbb8bb4737b0b8bed625e616ac6631779b0d8c992ca5b",
+          "repriceTxs": [
+            {
+              "step": "withdraw",
+              "hash": "0x6197f9197059f9d8fb21462a6b6aecbbf5ddc113df6d9e1eee130f156e538898"
+            },
+            {
+              "step": "move price",
+              "hash": "0x0f2b48c4e1eca7c46d85663271aa7122e091ca13e021d24967fa2d2ea8982946"
+            }
+          ],
+          "approvals": [
+            {
+              "token": "USDC",
+              "spender": "SwapRouter02",
+              "hash": "0x365308042b213076fb877cf33ec7e48365bf22409618b2c2f157462547ef607b"
+            },
+            {
+              "token": "USDC",
+              "spender": "PositionManager",
+              "hash": "0x7717cb126086eb5435d9a8013cf5b0c2bfd7eafac515296a6a64f93818454cb8"
+            },
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x4d4515f21fc628ffb53f6f574cd1477449486cf6ca9c76ffd2da8e7568c8215b"
+            }
+          ],
+          "mintTx": "0xd567b5f8d1db83fbd581df55569b63e75c5080a35ba19399ca8120e6497d2fb0",
+          "swapTx": null,
+          "tokenId": "233205",
+          "deposited0": "50000000",
+          "deposited1": "499999999999996943343",
+          "depositSource": "increaseLiquidity receipt",
+          "verification": "quote 0.001 USDC → 0.009989800424194169 BULLDOGS (expected ≈ 0.009995, price impact 0.0039954%)",
+          "notes": [
+            "withdrew 50.299883 USDC + 994036.476866644613609828 BULLDOGS (incl. fees) to wallet",
+            "repriced from 19762.260715 to 10.0 BULLDOGS/USDC"
+          ],
+          "updatedAt": "2026-10-05T21:02:26.914Z",
+          "history": [
+            {
+              "fee": 500,
+              "pool": "0xf49194dD602aF2923Fb149E705Ef006a193a9ddC",
+              "tickSpacing": 10,
+              "tickLower": -887270,
+              "tickUpper": 887270,
+              "status": "SUCCESS",
+              "initTx": "0x099fd7e66ac19705dcebbb8bb4737b0b8bed625e616ac6631779b0d8c992ca5b",
+              "approvals": [
+                {
+                  "token": "USDC",
+                  "spender": "PositionManager",
+                  "hash": "0x604443ecf8c5a38633c99554d39e6e41256428b81f7b8293cc639a7a46032e70"
+                },
+                {
+                  "token": "BULLDOGS",
+                  "spender": "PositionManager",
+                  "hash": "0x528729330618fc733eef0b0feedc168ca88defc915bdb3765074696c85d25557"
+                }
+              ],
+              "mintTx": "0xa9841a9807f9158e48062d37cd0622065378936b46c8703567d236743e557b0a",
+              "swapTx": null,
+              "tokenId": "233205",
+              "deposited0": "50000000",
+              "deposited1": "999999999999999965491995",
+              "depositSource": "mint receipt",
+              "verification": "quote 0.001 USDC → 19.979600807575864634 BULLDOGS (expected ≈ 19.99, price impact 0.0039958%)",
+              "updatedAt": "2026-10-05T18:58:04.456Z",
+              "target": "20000/1"
+            }
+          ]
+        },
+        "3000": {
+          "fee": 3000,
+          "target": "10/1",
+          "pool": "0xD828360D270167B4125014844e76ef1E98af17a1",
+          "tickSpacing": 60,
+          "tickLower": -887220,
+          "tickUpper": 887220,
+          "status": "REPRICED",
+          "initTx": "0x8a6c6baa28c7af6fcbf92726033e8eefb8751b72fe474e9d01a619739d7188bc",
+          "repriceTxs": [
+            {
+              "step": "withdraw",
+              "hash": "0xbb210e89c37baa6d6e37161fa5aca1853a827ef5d0103378969cff7a1c97281c"
+            },
+            {
+              "step": "move price",
+              "hash": "0x6fdd2c7a4e275addcd2de8ecf1c9e3fc89fbe8fcf4bbda82ff1ddad30d83ab87"
+            }
+          ],
+          "approvals": [
+            {
+              "token": "USDC",
+              "spender": "SwapRouter02",
+              "hash": "0x44745357f45339ff4d6baa2d87c6d9a7ad50ff59fb11a73380afb199a3e63287"
+            },
+            {
+              "token": "USDC",
+              "spender": "PositionManager",
+              "hash": "0x2122c7e6c44662fb9d29280fee0482ecc570b58f4e24a7b8869a40315352995a"
+            },
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x0822ba8db0e5c7ede0949806f2aaa12e456b0a2653dc098d2c5797d6bb18494f"
+            }
+          ],
+          "mintTx": "0x112bd016977ccbb6a75fcc4b96c8e9e2d1173a5b7b84f9889cb43fce263f00ca",
+          "swapTx": null,
+          "tokenId": "233206",
+          "deposited0": "50000000",
+          "deposited1": "499999999999996943343",
+          "depositSource": "increaseLiquidity receipt",
+          "verification": "quote 0.001 USDC → 0.009969801222437341 BULLDOGS (expected ≈ 0.00997, price impact 0.0039874%)",
+          "notes": [
+            "withdrew 50.249884 USDC + 995037.457663569897408476 BULLDOGS (incl. fees) to wallet",
+            "repriced from 19802.081165 to 10.0 BULLDOGS/USDC"
+          ],
+          "updatedAt": "2026-10-05T21:04:04.015Z",
+          "history": [
+            {
+              "fee": 3000,
+              "pool": "0xD828360D270167B4125014844e76ef1E98af17a1",
+              "tickSpacing": 60,
+              "tickLower": -887220,
+              "tickUpper": 887220,
+              "status": "SUCCESS",
+              "initTx": "0x8a6c6baa28c7af6fcbf92726033e8eefb8751b72fe474e9d01a619739d7188bc",
+              "approvals": [
+                {
+                  "token": "USDC",
+                  "spender": "PositionManager",
+                  "hash": "0x94e55bba4d2ee706319f3b95bde09efe830ef731550cb194ac0573810ef1fcf4"
+                },
+                {
+                  "token": "BULLDOGS",
+                  "spender": "PositionManager",
+                  "hash": "0x36e42ae72a67d386d83193249462bfbfa3498e94826ec5d31a608582fd347b6f"
+                }
+              ],
+              "mintTx": "0x824b423fdfca9a27c3a6ed93f86c8e0752bfef0c8bd6b505f519fd3f1bec7363",
+              "swapTx": null,
+              "tokenId": "233206",
+              "deposited0": "50000000",
+              "deposited1": "999999999999999965491995",
+              "depositSource": "mint receipt",
+              "verification": "quote 0.001 USDC → 19.939602404328057698 BULLDOGS (expected ≈ 19.94, price impact 0.0039878%)",
+              "updatedAt": "2026-10-05T18:59:03.831Z",
+              "target": "20000/1"
+            }
+          ]
+        },
+        "10000": {
+          "fee": 10000,
+          "target": "10/1",
+          "pool": "0x8b16079d0909052Dfdd6656d49F3D4600c536788",
+          "tickSpacing": 200,
+          "tickLower": -887200,
+          "tickUpper": 887200,
+          "status": "REPRICED",
+          "initTx": "0xe93cb08acbeac3126ad3b5c632f34f9a73b81f364c9f60a0f53730b7ff9db985",
+          "repriceTxs": [
+            {
+              "step": "withdraw",
+              "hash": "0xf8ffa39d38f408483fdf86c045c4d2cd76b064267f2df247276e13ccdc8597ba"
+            },
+            {
+              "step": "move price",
+              "hash": "0x56a0df9a4e6f24350905f0eae88962bfc9a518664d2c2104c4119f76e60d60e0"
+            }
+          ],
+          "approvals": [
+            {
+              "token": "USDC",
+              "spender": "SwapRouter02",
+              "hash": "0xd01e1e39e5673442fa939d06e1a2f39f29f3b5220160f9444eb50eab2510ed22"
+            },
+            {
+              "token": "USDC",
+              "spender": "PositionManager",
+              "hash": "0xf4ccadba55b18f508d521b6c7052d0516103f77a697690385ea0f0347fc10faf"
+            },
+            {
+              "token": "BULLDOGS",
+              "spender": "PositionManager",
+              "hash": "0x389cba261ae12074638b09d311e9e959a61c0b56cbc7fa93316c7640d137726e"
+            }
+          ],
+          "mintTx": "0x187c179e6c24ec6c41153c07f92ee7b19576f141c7ae594f7ad5ce88fc6186ac",
+          "swapTx": null,
+          "tokenId": "233208",
+          "deposited0": "50000000",
+          "deposited1": "499999999999996943343",
+          "depositSource": "increaseLiquidity receipt",
+          "verification": "quote 0.001 USDC → 0.009899804003729057 BULLDOGS (expected ≈ 0.0099, price impact 0.0039594%)",
+          "notes": [
+            "withdrew 50.099885 USDC + 998021.652685666511669636 BULLDOGS (incl. fees) to wallet",
+            "repriced from 19921.034605 to 10.0 BULLDOGS/USDC"
+          ],
+          "updatedAt": "2026-10-05T21:05:37.262Z",
+          "history": [
+            {
+              "fee": 10000,
+              "pool": "0x8b16079d0909052Dfdd6656d49F3D4600c536788",
+              "tickSpacing": 200,
+              "tickLower": -887200,
+              "tickUpper": 887200,
+              "status": "SUCCESS",
+              "initTx": "0xe93cb08acbeac3126ad3b5c632f34f9a73b81f364c9f60a0f53730b7ff9db985",
+              "approvals": [
+                {
+                  "token": "USDC",
+                  "spender": "PositionManager",
+                  "hash": "0xdc1df0df6828d3411d82e48c530e1e1695ac2aa0e3daa8a2c8ede4bf3550730d"
+                },
+                {
+                  "token": "BULLDOGS",
+                  "spender": "PositionManager",
+                  "hash": "0xf8d7aa777280734d42c2df5d77e3cb2c3ffabb7e6a6ef4d7fd0c0d3369019313"
+                }
+              ],
+              "mintTx": "0x4c1956ac551acdcee5e0515f4704949204232820a4b0b4333f5d99721b57cc5f",
+              "swapTx": null,
+              "tokenId": "233208",
+              "deposited0": "50000000",
+              "deposited1": "999999999999999965491995",
+              "depositSource": "mint receipt",
+              "verification": "quote 0.001 USDC → 19.799607967762238307 BULLDOGS (expected ≈ 19.8, price impact 0.0039598%)",
+              "updatedAt": "2026-10-05T18:59:50.839Z",
+              "target": "20000/1"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "usdc": "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
+  "token": "0xBc2BEfb9a8aA70AfA23F7451A0794466976B6974",
+  "factory": "0x0227628f3F023bb0B980b67D528571c95c6DaC1c",
+  "positionManager": "0x1238536071E1c677A632429e3655c799b22cDA52",
+  "updatedAt": "2026-10-05T21:05:37.262Z"
+}
