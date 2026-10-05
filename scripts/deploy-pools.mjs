@@ -1,12 +1,15 @@
 #!/usr/bin/env node
-// Deploys USDC/TOKEN Uniswap V3 pools on Ethereum Sepolia (one per fee tier), initialised at
-// 1 USDC = 20,000 TOKEN, and seeds each with a full-range position of 50 USDC + 1,000,000 TOKEN.
+// Deploys TOKEN Uniswap V3 pools on Ethereum Sepolia (one per fee tier) against a quote token (USDC or
+// WETH, see PAIRS in lib/config.mjs) at the pair's target price, each seeded with a full-range position.
 //
 // Idempotent: existing pools, positions and allowances are inspected and completed steps skipped.
 //
 //   node scripts/deploy-pools.mjs --dry-run   read-only checks and plan, sends nothing
 //   node scripts/deploy-pools.mjs             deploy
 //   node scripts/deploy-pools.mjs --swap      deploy, then also run a tiny real verification swap
+//   node scripts/deploy-pools.mjs --reprice   move off-target pools where the deployer is the only LP:
+//                                             withdraw, swap the price to target, re-add liquidity
+//   --pair <usdc|weth>                        which pool family (default usdc); weth wraps ETH as needed
 //
 // PRIVATE_KEY is read only from the environment (or a git-ignored .env) and is never printed.
 
@@ -20,27 +23,36 @@ import {
 
 import * as C from './lib/config.mjs';
 import {
-  ERC20_ABI, FACTORY_ABI, POOL_ABI, POSITION_MANAGER_ABI, QUOTER_V2_ABI, SWAP_ROUTER_02_ABI,
+  ERC20_ABI, FACTORY_ABI, POOL_ABI, POSITION_MANAGER_ABI, QUOTER_V2_ABI, SWAP_ROUTER_02_ABI, WETH9_ABI,
 } from './lib/abis.mjs';
 import {
   applyBps, deviationPpb, encodeSqrtPriceX96, formatPpbAsPercent, formatRational, fullRangeTicks,
-  sortTokens, targetRawRatio, tokenPerUsdcFromSqrtPrice,
+  priceMoveInput, sortTokens, targetRawRatio, tokenPerQuoteFromSqrtPrice,
 } from './lib/math.mjs';
 import { describeError, installRedaction, redact, registerSecret } from './lib/log.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const STATE_FILE = path.join(ROOT, 'deployments', 'sepolia-uniswap-v3.json');
-const SUMMARY_FILE = path.join(ROOT, 'deployments', 'sepolia-uniswap-v3-summary.md');
+// DEPLOYMENTS_DIR lets fork tests write somewhere other than the real deployment record.
+let STATE_FILE;
+let SUMMARY_FILE;
+function setOutputPaths(pair) {
+  const dir = process.env.DEPLOYMENTS_DIR?.trim() ? path.resolve(process.env.DEPLOYMENTS_DIR.trim()) : path.join(ROOT, 'deployments');
+  STATE_FILE = path.join(dir, pair.stateFile);
+  SUMMARY_FILE = path.join(dir, pair.summaryFile);
+}
+const MAX_UINT128 = (1n << 128n) - 1n;
 
 const STATUS = {
   SUCCESS: 'SUCCESS',
+  REPRICED: 'REPRICED',
   ALREADY_DEPLOYED: 'ALREADY_DEPLOYED',
   PRICE_MISMATCH: 'PRICE_MISMATCH',
   INSUFFICIENT_BALANCE: 'INSUFFICIENT_BALANCE',
   FAILED: 'FAILED',
 };
 // Plan actions that commit liquidity.
-const FUNDING_ACTIONS = new Set(['CREATE', 'INITIALIZE', 'MINT']);
+const FUNDING_ACTIONS = new Set(['CREATE', 'INITIALIZE', 'MINT', 'TOP_UP', 'REPRICE']);
+const DONE_STATUSES = new Set([STATUS.SUCCESS, STATUS.REPRICED, STATUS.ALREADY_DEPLOYED]);
 
 /** Stops the whole run (wrong chain, unverified target, out of gas money, stuck tx). */
 class DeploymentAbort extends Error {}
@@ -55,11 +67,19 @@ class PoolStop extends Error {
 // ───────────────────────────── setup ─────────────────────────────
 
 function parseArgs() {
-  const known = new Set(['--dry-run', '--swap']);
+  const flags = new Set(['--dry-run', '--swap', '--reprice']);
   const args = process.argv.slice(2);
-  const unknown = args.filter((a) => !known.has(a));
+  let pairKey = 'usdc';
+  const unknown = [];
+  for (let i = 0; i < args.length; i++) {
+    if (flags.has(args[i])) continue;
+    if (args[i] === '--pair') pairKey = args[++i];
+    else if (args[i].startsWith('--pair=')) pairKey = args[i].slice('--pair='.length);
+    else unknown.push(args[i]);
+  }
   if (unknown.length) throw new DeploymentAbort(`Unknown argument(s): ${unknown.join(' ')}`);
-  return { dryRun: args.includes('--dry-run'), swapTest: args.includes('--swap') };
+  if (!Object.hasOwn(C.PAIRS, pairKey)) throw new DeploymentAbort(`Unknown --pair "${pairKey}"; choose one of: ${Object.keys(C.PAIRS).join(', ')}`);
+  return { dryRun: args.includes('--dry-run'), swapTest: args.includes('--swap'), reprice: args.includes('--reprice'), pairKey };
 }
 
 function loadDotEnv() {
@@ -109,7 +129,7 @@ async function readTokenInfo(contract, label) {
 
 async function verifyContracts(ctx) {
   const named = {
-    USDC: C.ADDRESSES.USDC,
+    'Quote token': ctx.pair.quote,
     TOKEN: C.ADDRESSES.TOKEN,
     UniswapV3Factory: C.ADDRESSES.FACTORY,
     NonfungiblePositionManager: C.ADDRESSES.POSITION_MANAGER,
@@ -128,18 +148,43 @@ async function verifyContracts(ctx) {
   for (const [name, f] of Object.entries(reported)) {
     if (getAddress(f) !== factory) throw new DeploymentAbort(`${name} reports factory ${f}, expected ${factory}.`);
   }
+  if (ctx.pair.wrapNative) {
+    const weth9 = getAddress(await ctx.npm.WETH9());
+    if (weth9 !== getAddress(ctx.pair.quote)) throw new DeploymentAbort(`PositionManager WETH9 is ${weth9}, expected ${ctx.pair.quote}.`);
+  }
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
 
-const fmtUsdc = (ctx, raw) => (raw == null ? '—' : `${formatUnits(raw, ctx.usdcInfo.decimals)} ${ctx.usdcInfo.symbol}`);
+const fmtQuote = (ctx, raw) => (raw == null ? '—' : `${formatUnits(raw, ctx.quoteInfo.decimals)} ${ctx.quoteInfo.symbol}`);
 const fmtToken = (ctx, raw) => (raw == null ? '—' : `${formatUnits(raw, ctx.tokenInfo.decimals)} ${ctx.tokenInfo.symbol}`);
 const feePct = (fee) => `${(fee / 10_000).toFixed(2)}%`;
-const txLink = (hash) => `${C.EXPLORER_TX}${hash}`;
-const tokenContract = (ctx, addr) => (getAddress(addr) === ctx.usdcInfo.address ? ctx.usdc : ctx.token);
-const symbolOf = (ctx, addr) => (getAddress(addr) === ctx.usdcInfo.address ? ctx.usdcInfo.symbol : ctx.tokenInfo.symbol);
-const usdcOf = (ctx, a0, a1) => (ctx.usdcIsToken0 ? a0 : a1);
-const tokenOf = (ctx, a0, a1) => (ctx.usdcIsToken0 ? a1 : a0);
+const tokenContract = (ctx, addr) => (getAddress(addr) === ctx.quoteInfo.address ? ctx.quote : ctx.token);
+const symbolOf = (ctx, addr) => (getAddress(addr) === ctx.quoteInfo.address ? ctx.quoteInfo.symbol : ctx.tokenInfo.symbol);
+const quoteOf = (ctx, a0, a1) => (ctx.quoteIsToken0 ? a0 : a1);
+const tokenOf = (ctx, a0, a1) => (ctx.quoteIsToken0 ? a1 : a0);
+const fmtFor = (ctx, addr, raw) => (getAddress(addr) === ctx.quoteInfo.address ? fmtQuote(ctx, raw) : fmtToken(ctx, raw));
+const fromReceipt = (row) => Boolean(row.depositSource?.endsWith('receipt'));
+
+async function deadline(ctx) {
+  const block = await ctx.provider.getBlock('latest');
+  return BigInt(block.timestamp + C.DEADLINE_SECONDS);
+}
+
+/** What withdrawing `liquidity` from a deployer position would return right now (excludes owed fees). */
+async function simulateWithdraw(ctx, tokenId, liquidity) {
+  const [amount0, amount1] = await ctx.npm.decreaseLiquidity.staticCall({
+    tokenId, liquidity, amount0Min: 0n, amount1Min: 0n, deadline: await deadline(ctx),
+  });
+  return { amount0, amount1 };
+}
+
+function parseEvents(iface, receipt, emitter) {
+  return receipt.logs
+    .filter((l) => getAddress(l.address) === getAddress(emitter))
+    .map((l) => iface.parseLog(l))
+    .filter(Boolean);
+}
 
 function newRow(ctx, fee) {
   return {
@@ -148,6 +193,7 @@ function newRow(ctx, fee) {
     sqrtPriceX96: null, tick: null, liquidity: null, currentPrice: null, deviationPpb: null,
     tokenId: null, positionLiquidity: null, deposited0: null, deposited1: null, depositSource: null,
     initTx: null, approvals: [], mintTx: null, swapTx: null, verification: null,
+    reprice: null, repriceTxs: [], wrapTxs: [], history: [],
   };
 }
 
@@ -175,14 +221,14 @@ function recordPoolState(ctx, row, ps) {
   row.tick = ps.tick;
   row.liquidity = ps.liquidity;
   if (ps.sqrtPriceX96 > 0n) {
-    const price = tokenPerUsdcFromSqrtPrice(ps.sqrtPriceX96, ctx.decimals);
+    const price = tokenPerQuoteFromSqrtPrice(ps.sqrtPriceX96, ctx.decimals);
     row.currentPrice = formatRational(price, 6);
-    row.deviationPpb = deviationPpb(price, C.TARGET_TOKEN_PER_USDC);
+    row.deviationPpb = deviationPpb(price, ctx.pair.target);
   }
 }
 
 function priceMismatchMessage(ctx, row) {
-  return `current ${row.currentPrice} ${ctx.tokenInfo.symbol}/USDC vs expected ${ctx.targetPriceLabel}, ` +
+  return `current ${row.currentPrice} ${ctx.priceUnit} vs expected ${ctx.targetPriceLabel}, ` +
     `deviation ${formatPpbAsPercent(row.deviationPpb)} > 1%`;
 }
 
@@ -225,7 +271,7 @@ function loadState(ctx) {
     file = { chainId: C.SEPOLIA_CHAIN_ID.toString(), deployers: {} };
   }
   Object.assign(file, {
-    usdc: ctx.usdcInfo.address, token: ctx.tokenInfo.address,
+    quote: ctx.quoteInfo.address, token: ctx.tokenInfo.address,
     factory: C.ADDRESSES.FACTORY, positionManager: C.ADDRESSES.POSITION_MANAGER,
   });
   file.deployers[ctx.address] ??= { pools: {} };
@@ -237,10 +283,11 @@ function persist(ctx, row) {
   const pools = ctx.state.deployers[ctx.address].pools;
   const str = (v) => (v == null ? null : v.toString());
   pools[row.fee] = {
-    fee: row.fee, pool: row.pool, tickSpacing: row.tickSpacing, tickLower: row.tickLower, tickUpper: row.tickUpper,
-    status: row.status, initTx: row.initTx, approvals: row.approvals, mintTx: row.mintTx, swapTx: row.swapTx,
+    fee: row.fee, target: ctx.targetKey, pool: row.pool, tickSpacing: row.tickSpacing, tickLower: row.tickLower, tickUpper: row.tickUpper,
+    status: row.status, initTx: row.initTx, repriceTxs: row.repriceTxs, wrapTxs: row.wrapTxs, approvals: row.approvals, mintTx: row.mintTx, swapTx: row.swapTx,
     tokenId: str(row.tokenId), deposited0: str(row.deposited0), deposited1: str(row.deposited1),
-    depositSource: row.depositSource, verification: row.verification, updatedAt: new Date().toISOString(),
+    depositSource: row.depositSource, verification: row.verification, notes: row.notes, updatedAt: new Date().toISOString(),
+    history: row.history,
   };
   ctx.state.updatedAt = new Date().toISOString();
   fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
@@ -254,14 +301,25 @@ function adoptPriorState(ctx, row) {
   const prior = ctx.state.deployers[ctx.address].pools[row.fee];
   if (!prior || !row.pool || prior.pool !== row.pool) return;
   row.initTx = prior.initTx ?? null;
+  row.history = prior.history ?? [];
+  // Entries without a target predate target tracking; the pair config says which target wrote them.
+  const priorTarget = prior.target ?? ctx.pair.legacyTarget ?? ctx.targetKey;
+  if (priorTarget !== ctx.targetKey) {
+    // Different target: archive the old record instead of mixing its deposits and txs into this one.
+    const { history: _history, ...previous } = prior;
+    row.history = [...row.history, { ...previous, target: priorTarget }];
+    return;
+  }
+  row.repriceTxs = prior.repriceTxs ?? [];
+  row.wrapTxs = prior.wrapTxs ?? [];
   if (row.tokenId != null && prior.tokenId === row.tokenId.toString()) {
     row.approvals = prior.approvals ?? [];
     row.mintTx = prior.mintTx ?? null;
     row.swapTx = prior.swapTx ?? null;
-    if (prior.depositSource === 'mint receipt' && prior.deposited0 != null) {
+    if (prior.depositSource?.endsWith('receipt') && prior.deposited0 != null) {
       row.deposited0 = BigInt(prior.deposited0);
       row.deposited1 = BigInt(prior.deposited1);
-      row.depositSource = 'mint receipt';
+      row.depositSource = prior.depositSource;
     }
   }
 }
@@ -272,8 +330,8 @@ function adoptPriorState(ctx, row) {
  * The only path that broadcasts. Before signing: chain ID re-check, target allowlist + code check,
  * eth_call simulation, gas estimate and an ETH sufficiency check. Waits for the receipt.
  */
-async function sendTx(ctx, { label, contract, method, args }) {
-  const populated = await contract.getFunction(method).populateTransaction(...args);
+async function sendTx(ctx, { label, contract, method, args, value = 0n }) {
+  const populated = await contract.getFunction(method).populateTransaction(...args, ...(value > 0n ? [{ value }] : []));
   const target = getAddress(populated.to);
   if (!ctx.allowedTargets.has(target)) throw new DeploymentAbort(`Refusing "${label}": ${target} is not a verified contract.`);
 
@@ -293,7 +351,7 @@ async function sendTx(ctx, { label, contract, method, args }) {
   const gasLimit = (gasEstimate * C.GAS_LIMIT_BUFFER_PCT) / 100n;
   const feeData = await ctx.provider.getFeeData();
   const maxFeePerGas = feeData.maxFeePerGas ?? feeData.gasPrice;
-  const maxCost = gasLimit * maxFeePerGas;
+  const maxCost = gasLimit * maxFeePerGas + value;
   const balance = await ctx.provider.getBalance(ctx.address);
   if (balance < maxCost) {
     throw new DeploymentAbort(`Not enough Sepolia ETH for "${label}": need up to ${formatEther(maxCost)} ETH, have ${formatEther(balance)} ETH.`);
@@ -302,7 +360,7 @@ async function sendTx(ctx, { label, contract, method, args }) {
   // Track the nonce locally too: load-balanced RPCs can briefly report a stale pending count.
   const chainNonce = await ctx.provider.getTransactionCount(ctx.address, 'pending');
   const nonce = ctx.nextNonce != null && ctx.nextNonce > chainNonce ? ctx.nextNonce : chainNonce;
-  const request = { to: populated.to, data: populated.data, gasLimit, nonce };
+  const request = { to: populated.to, data: populated.data, value, gasLimit, nonce };
   if (feeData.maxFeePerGas != null) {
     request.maxFeePerGas = feeData.maxFeePerGas;
     request.maxPriorityFeePerGas = feeData.maxPriorityFeePerGas;
@@ -310,7 +368,7 @@ async function sendTx(ctx, { label, contract, method, args }) {
     request.gasPrice = feeData.gasPrice;
   }
 
-  console.log(`    → ${label} (gas est. ${gasEstimate}, max cost ${formatEther(maxCost)} ETH)`);
+  console.log(`    → ${label} (gas est. ${gasEstimate}, max cost ${formatEther(maxCost)} ETH${value > 0n ? ' incl. value' : ''})`);
   const tx = await ctx.wallet.sendTransaction(request);
   ctx.nextNonce = tx.nonce + 1;
   console.log(`      tx ${tx.hash}`);
@@ -329,12 +387,26 @@ async function sendTx(ctx, { label, contract, method, args }) {
   return { hash: tx.hash, receipt, simulated };
 }
 
+/** WETH-quoted pairs: wrap just enough of the wallet's ETH to hold `needed` of the quote token. */
+async function wrapIfNeeded(ctx, row, tokenAddr, needed) {
+  if (!ctx.pair.wrapNative || getAddress(tokenAddr) !== ctx.quoteInfo.address) return;
+  const balance = await ctx.quote.balanceOf(ctx.address);
+  if (balance >= needed) return;
+  const amount = needed - balance;
+  const { hash } = await sendTx(ctx, {
+    label: `fee ${row.fee}: wrap ${formatEther(amount)} ETH → ${ctx.quoteInfo.symbol}`,
+    contract: ctx.quote, method: 'deposit', args: [], value: amount,
+  });
+  row.wrapTxs.push(hash);
+  persist(ctx, row);
+}
+
 async function ensureAllowance(ctx, row, tokenAddr, spender, spenderName, required) {
   const token = tokenContract(ctx, tokenAddr);
   const symbol = symbolOf(ctx, tokenAddr);
   const current = await token.allowance(ctx.address, spender);
   if (current >= required) {
-    const decimals = getAddress(tokenAddr) === ctx.usdcInfo.address ? ctx.usdcInfo.decimals : ctx.tokenInfo.decimals;
+    const decimals = getAddress(tokenAddr) === ctx.quoteInfo.address ? ctx.quoteInfo.decimals : ctx.tokenInfo.decimals;
     console.log(`    ✓ ${symbol} allowance for ${spenderName} already sufficient (${formatUnits(current, decimals)})`);
     return;
   }
@@ -374,15 +446,22 @@ async function planPool(ctx, fee, positions) {
       return row;
     }
     if (row.deviationPpb > C.MAX_PRICE_DEVIATION_PPB) {
-      throw new PoolStop(STATUS.PRICE_MISMATCH, priceMismatchMessage(ctx, row));
+      await planReprice(ctx, row, ps, positions);
+      return row;
     }
     const existing = findDeployedPosition(ctx, row, positions);
-    if (existing) {
-      row.action = 'VERIFY_ONLY';
-      row.tokenId = existing.tokenId;
-    } else {
+    if (!existing) {
       row.action = 'MINT';
+      return row;
     }
+    row.tokenId = existing.tokenId;
+    const value = await simulateWithdraw(ctx, existing.tokenId, existing.liquidity);
+    const quoteValue = quoteOf(ctx, value.amount0, value.amount1);
+    const tokenValue = tokenOf(ctx, value.amount0, value.amount1);
+    const underfunded = quoteValue * 100n < ctx.desiredQuote * C.TOP_UP_BELOW_PCT &&
+      tokenValue * 100n < ctx.desiredToken * C.TOP_UP_BELOW_PCT;
+    row.action = underfunded ? 'TOP_UP' : 'VERIFY_ONLY';
+    if (underfunded) row.notes.push(`position #${existing.tokenId} held only ${fmtQuote(ctx, quoteValue)} + ${fmtToken(ctx, tokenValue)} before top-up`);
   } catch (err) {
     if (err instanceof DeploymentAbort) throw err;
     row.action = 'NONE';
@@ -398,46 +477,147 @@ const ACTION_TEXT = {
   CREATE: 'create + initialize pool, approve, mint full-range position, verify',
   INITIALIZE: 'initialize existing pool, approve, mint full-range position, verify',
   MINT: 'pool already at target price; approve and mint full-range position, verify',
+  TOP_UP: 'pool at target price but deployer position is under-funded; approve and add liquidity, verify',
+  REPRICE: 'withdraw liquidity, swap price to target, re-add liquidity, verify',
   VERIFY_ONLY: 'deployer already holds a full-range position; verify only',
   NONE: 'no action',
 };
 
+/** The pair's repricePushBudget (in quote token) expressed in units of the swap's input token. */
+function pushBudget(ctx, tokenIn) {
+  const quoteBudget = parseUnits(ctx.pair.repricePushBudget, ctx.quoteInfo.decimals);
+  if (getAddress(tokenIn) === ctx.quoteInfo.address) return quoteBudget;
+  const { num, den } = ctx.pair.target;
+  return (quoteBudget * num * 10n ** BigInt(ctx.tokenInfo.decimals)) / (den * 10n ** BigInt(ctx.quoteInfo.decimals));
+}
+
+/**
+ * How to move a pool whose only active liquidity is the deployer's position: the swap direction, and how
+ * much liquidity to withdraw first so the price-moving swap costs at most half the push budget.
+ */
+function repricePlan(ctx, row, sqrtPriceX96, positionLiquidity) {
+  const full = priceMoveInput(positionLiquidity, sqrtPriceX96, ctx.targetSqrtPriceX96, row.fee);
+  const [tokenIn, tokenOut] = full.zeroForOne ? [ctx.token0, ctx.token1] : [ctx.token1, ctx.token0];
+  const budget = pushBudget(ctx, tokenIn);
+  let keep = positionLiquidity;
+  if (full.amountIn > budget) {
+    keep = (positionLiquidity * (budget / 2n)) / full.amountIn;
+    if (keep < 1n) keep = 1n;
+  }
+  const pushIn = priceMoveInput(keep, sqrtPriceX96, ctx.targetSqrtPriceX96, row.fee).amountIn;
+  return { tokenIn, tokenOut, budget, keep, remove: positionLiquidity - keep, pushIn, fullCost: full.amountIn };
+}
+
+/** Off-target pool: PRICE_MISMATCH unless --reprice is set and the deployer can safely move it. */
+async function planReprice(ctx, row, ps, positions) {
+  const mismatch = priceMismatchMessage(ctx, row);
+  if (!ctx.reprice) throw new PoolStop(STATUS.PRICE_MISMATCH, `${mismatch} (use --reprice to move it if you are the only LP)`);
+  const pos = findDeployedPosition(ctx, row, positions);
+  if (!pos) throw new PoolStop(STATUS.PRICE_MISMATCH, `${mismatch}; cannot reprice: deployer has no full-range position here`);
+  if (ps.liquidity !== pos.liquidity) {
+    throw new PoolStop(STATUS.PRICE_MISMATCH,
+      `${mismatch}; cannot reprice: other LPs are active (pool liquidity ${ps.liquidity}, deployer ${pos.liquidity})`);
+  }
+  const plan = repricePlan(ctx, row, ps.sqrtPriceX96, pos.liquidity);
+  // Quote a swap straight to the target against today's liquidity. Any initialized tick on the way is
+  // someone else's position, which the price-moving swap would trade through.
+  const quote = await ctx.quoter.quoteExactInputSingle.staticCall({
+    tokenIn: plan.tokenIn, tokenOut: plan.tokenOut, amountIn: 1n << 127n, fee: row.fee, sqrtPriceLimitX96: ctx.targetSqrtPriceX96,
+  });
+  if (quote.initializedTicksCrossed > 0n) {
+    throw new PoolStop(STATUS.PRICE_MISMATCH, `${mismatch}; cannot reprice: ${quote.initializedTicksCrossed} other position boundary tick(s) lie between the current and target price`);
+  }
+  if (quote.sqrtPriceX96After !== ctx.targetSqrtPriceX96) {
+    throw new PoolStop(STATUS.PRICE_MISMATCH, `${mismatch}; cannot reprice: target price not reachable by swapping`);
+  }
+  row.tokenId = pos.tokenId;
+  row.reprice = {
+    ...plan,
+    fromPrice: row.currentPrice,
+    expectedWithdraw: plan.remove > 0n ? await simulateWithdraw(ctx, pos.tokenId, plan.remove) : { amount0: 0n, amount1: 0n },
+    positionLiquidity: pos.liquidity,
+  };
+  row.action = 'REPRICE';
+}
+
+function describeReprice(ctx, row) {
+  const r = row.reprice;
+  const pct = formatUnits((r.remove * 1_000_000n) / r.positionLiquidity, 4);
+  const back = r.remove > 0n
+    ? `withdraw ${pct}% of NFT #${row.tokenId} (≈ ${fmtQuote(ctx, quoteOf(ctx, r.expectedWithdraw.amount0, r.expectedWithdraw.amount1))} + ` +
+      `${fmtToken(ctx, tokenOf(ctx, r.expectedWithdraw.amount0, r.expectedWithdraw.amount1))} back to wallet), `
+    : '';
+  return `${r.fromPrice} → ${ctx.targetPriceLabel}: ${back}move price with ≤ ${fmtFor(ctx, r.tokenIn, r.pushIn)}, ` +
+    `then add ${fmtQuote(ctx, ctx.desiredQuote)} + ${fmtToken(ctx, ctx.desiredToken)} to NFT #${row.tokenId}`;
+}
+
 async function preflight(ctx, rows) {
-  const funding = rows.filter((r) => FUNDING_ACTIONS.has(r.action));
-  const swapping = ctx.swapTest ? rows.filter((r) => (FUNDING_ACTIONS.has(r.action) || r.action === 'VERIFY_ONLY') && !r.swapTx) : [];
-  const swapIn = parseUnits(C.VERIFY_SWAP_USDC, ctx.usdcInfo.decimals);
-
-  const needUsdc = ctx.desiredUsdc * BigInt(funding.length) + swapIn * BigInt(swapping.length);
-  const needToken = ctx.desiredToken * BigInt(funding.length);
-
+  const swapIn = parseUnits(ctx.pair.verifySwap, ctx.quoteInfo.decimals);
+  const quote = ctx.quoteInfo.address;
+  const token = ctx.tokenInfo.address;
+  const need = { [quote]: 0n, [token]: 0n };
+  const fromWithdrawals = { [quote]: 0n, [token]: 0n };
   let gas = 0n;
-  for (const row of funding) {
+  let funding = 0;
+  let swaps = 0;
+
+  for (const row of rows) {
+    if (FUNDING_ACTIONS.has(row.action)) {
+      funding++;
+      need[quote] += ctx.desiredQuote;
+      need[token] += ctx.desiredToken;
+      gas += 2n * C.GAS_BUDGET.approve + (row.tokenId != null ? C.GAS_BUDGET.increase : C.GAS_BUDGET.mint);
+    }
     if (row.action === 'CREATE' || row.action === 'INITIALIZE') {
       gas += await ctx.npm.createAndInitializePoolIfNecessary.estimateGas(ctx.token0, ctx.token1, row.fee, ctx.targetSqrtPriceX96);
     }
-    gas += 2n * C.GAS_BUDGET.approve + C.GAS_BUDGET.mint;
+    if (row.action === 'REPRICE') {
+      const r = row.reprice;
+      if (r.remove > 0n) {
+        gas += C.GAS_BUDGET.withdraw;
+        fromWithdrawals[ctx.token0] += r.expectedWithdraw.amount0;
+        fromWithdrawals[ctx.token1] += r.expectedWithdraw.amount1;
+      }
+      gas += C.GAS_BUDGET.approve + C.GAS_BUDGET.swap;
+      need[r.tokenIn] += r.pushIn * 2n + 10n;
+    }
+    if (ctx.swapTest && (FUNDING_ACTIONS.has(row.action) || row.action === 'VERIFY_ONLY') && !row.swapTx) {
+      swaps++;
+      need[quote] += swapIn;
+      gas += C.GAS_BUDGET.approve + C.GAS_BUDGET.swap;
+    }
   }
-  gas += BigInt(swapping.length) * (C.GAS_BUDGET.approve + C.GAS_BUDGET.swap);
+  const [ethBal, quoteBal, tokenBal] = await Promise.all([
+    ctx.provider.getBalance(ctx.address), ctx.quote.balanceOf(ctx.address), ctx.token.balanceOf(ctx.address),
+  ]);
+  // WETH-quoted pairs cover any WETH shortfall by wrapping ETH, one wrap per funded pool at most.
+  let wrap = 0n;
+  if (ctx.pair.wrapNative) {
+    const short = need[quote] - quoteBal - fromWithdrawals[quote];
+    if (short > 0n) {
+      wrap = short;
+      gas += BigInt(funding + swaps) * C.GAS_BUDGET.wrap;
+    }
+  }
   gas = (gas * C.GAS_LIMIT_BUFFER_PCT) / 100n;
   const feeData = await ctx.provider.getFeeData();
   const maxFeePerGas = feeData.maxFeePerGas ?? feeData.gasPrice;
-  const needEth = gas * maxFeePerGas;
+  const gasEth = gas * maxFeePerGas;
 
-  const [ethBal, usdcBal, tokenBal] = await Promise.all([
-    ctx.provider.getBalance(ctx.address), ctx.usdc.balanceOf(ctx.address), ctx.token.balanceOf(ctx.address),
-  ]);
-
-  console.log(`\nBalances vs. requirement (${funding.length} pool(s) to fund${swapping.length ? `, ${swapping.length} test swap(s)` : ''}):`);
+  const extras = [swaps && `${swaps} test swap(s)`, rows.some((r) => r.action === 'REPRICE') && `${rows.filter((r) => r.action === 'REPRICE').length} reprice(s)`].filter(Boolean);
+  console.log(`\nBalances vs. requirement (${funding} pool(s) to fund${extras.length ? `, incl. ${extras.join(', ')}` : ''}):`);
   const shortfalls = [];
-  const line = (name, have, need, fmt) => {
-    const ok = have >= need;
-    console.log(`  ${ok ? '✓' : '✗'} ${name.padEnd(5)} have ${fmt(have)}, need ${fmt(need)}${ok ? '' : `  → missing ${fmt(need - have)}`}`);
-    if (!ok) shortfalls.push(`${name}: missing ${fmt(need - have)}`);
+  const line = (name, have, credit, needed, fmt, creditLabel = 'from withdrawals') => {
+    const ok = have + credit >= needed;
+    const creditText = credit > 0n ? ` (+ ≈${fmt(credit)} ${creditLabel})` : '';
+    console.log(`  ${ok ? '✓' : '✗'} ${name.padEnd(5)} have ${fmt(have)}${creditText}, need ${fmt(needed)}${ok ? '' : `  → missing ${fmt(needed - have - credit)}`}`);
+    if (!ok) shortfalls.push(`${name}: missing ${fmt(needed - have - credit)}`);
   };
-  line('ETH', ethBal, needEth, (v) => `${formatEther(v)} ETH`);
-  line('USDC', usdcBal, needUsdc, (v) => fmtUsdc(ctx, v));
-  line('TOKEN', tokenBal, needToken, (v) => fmtToken(ctx, v));
-  console.log(`  (ETH need = ${gas} gas incl. 20% buffer × max fee ${formatUnits(maxFeePerGas, 'gwei')} gwei)`);
+  line('ETH', ethBal, 0n, gasEth + wrap, (v) => `${formatEther(v)} ETH`);
+  line(ctx.quoteInfo.symbol, quoteBal, fromWithdrawals[quote] + wrap, need[quote], (v) => fmtQuote(ctx, v),
+    wrap > 0n ? 'wrapped from ETH' : 'from withdrawals');
+  line('TOKEN', tokenBal, fromWithdrawals[token], need[token], (v) => fmtToken(ctx, v));
+  console.log(`  (ETH need = ${wrap > 0n ? `${formatEther(wrap)} ETH to wrap + ` : ''}${gas} gas incl. 20% buffer × max fee ${formatUnits(maxFeePerGas, 'gwei')} gwei)`);
   return shortfalls;
 }
 
@@ -461,24 +641,104 @@ async function executePool(ctx, row) {
     console.log(`    pool ${poolAddr}`);
   }
 
+  if (row.action === 'REPRICE') await movePrice(ctx, row);
+
   // Re-read right before committing funds: the pool may have been touched since planning.
   const ps = await readPoolState(ctx, row.pool);
   assertPoolIdentity(ctx, row, ps);
   if (ps.sqrtPriceX96 === 0n) throw new Error('pool is still uninitialized');
   recordPoolState(ctx, row, ps);
-  console.log(`    price ${row.currentPrice} ${ctx.tokenInfo.symbol}/USDC (deviation ${formatPpbAsPercent(row.deviationPpb)}), tick ${row.tick}`);
+  console.log(`    price ${row.currentPrice} ${ctx.priceUnit} (deviation ${formatPpbAsPercent(row.deviationPpb)}), tick ${row.tick}`);
   if (row.deviationPpb > C.MAX_PRICE_DEVIATION_PPB) throw new PoolStop(STATUS.PRICE_MISMATCH, priceMismatchMessage(ctx, row));
 
   if (row.action !== 'VERIFY_ONLY') await addLiquidity(ctx, row);
   await verifyPool(ctx, row);
 }
 
+/**
+ * --reprice: withdraw all but a sliver of the deployer's liquidity, then swap that sliver to the target
+ * price. Liquidity is re-added afterwards by addLiquidity(). Each step re-reads chain state, so an
+ * interrupted run resumes where it stopped.
+ */
+async function movePrice(ctx, row) {
+  const npmAddr = getAddress(C.ADDRESSES.POSITION_MANAGER);
+  const fromPrice = row.reprice.fromPrice;
+  let ps = await readPoolState(ctx, row.pool);
+  let pos = await ctx.npm.positions(row.tokenId);
+  if (ps.liquidity !== pos.liquidity) throw new PoolStop(STATUS.PRICE_MISMATCH, 'other LPs became active since planning; not repricing');
+  let plan = repricePlan(ctx, row, ps.sqrtPriceX96, pos.liquidity);
+
+  if (plan.remove > 0n) {
+    const sim = await simulateWithdraw(ctx, row.tokenId, plan.remove);
+    const dl = await deadline(ctx);
+    const calls = [
+      ctx.npm.interface.encodeFunctionData('decreaseLiquidity', [{
+        tokenId: row.tokenId, liquidity: plan.remove, deadline: dl,
+        amount0Min: applyBps(sim.amount0, C.WITHDRAW_SLIPPAGE_BPS), amount1Min: applyBps(sim.amount1, C.WITHDRAW_SLIPPAGE_BPS),
+      }]),
+      ctx.npm.interface.encodeFunctionData('collect', [{
+        tokenId: row.tokenId, recipient: ctx.address, amount0Max: MAX_UINT128, amount1Max: MAX_UINT128,
+      }]),
+    ];
+    const pct = formatUnits((plan.remove * 1_000_000n) / pos.liquidity, 4);
+    const { hash, receipt } = await sendTx(ctx, {
+      label: `fee ${row.fee}: withdraw ${pct}% of NFT #${row.tokenId} and collect`, contract: ctx.npm, method: 'multicall', args: [calls],
+    });
+    row.repriceTxs.push({ step: 'withdraw', hash });
+    const collect = parseEvents(ctx.npm.interface, receipt, npmAddr).find((e) => e.name === 'Collect');
+    if (collect) {
+      const text = `${fmtQuote(ctx, quoteOf(ctx, collect.args.amount0, collect.args.amount1))} + ${fmtToken(ctx, tokenOf(ctx, collect.args.amount0, collect.args.amount1))}`;
+      row.notes.push(`withdrew ${text} (incl. fees) to wallet`);
+      console.log(`    collected ${text}`);
+    }
+    persist(ctx, row);
+    ps = await readPoolState(ctx, row.pool);
+    pos = await ctx.npm.positions(row.tokenId);
+    plan = repricePlan(ctx, row, ps.sqrtPriceX96, pos.liquidity);
+  } else {
+    console.log('    ✓ remaining liquidity is already small enough to move the price cheaply; no withdrawal needed');
+  }
+  if (plan.remove > 0n) throw new Error(`moving the price would still cost ${fmtFor(ctx, plan.tokenIn, plan.fullCost)}, above the push budget`);
+
+  // The pool stops at the price limit, so only what is needed is spent; the margin covers rounding.
+  const amountIn = plan.pushIn * 2n + 10n;
+  await wrapIfNeeded(ctx, row, plan.tokenIn, amountIn);
+  const balance = await tokenContract(ctx, plan.tokenIn).balanceOf(ctx.address);
+  if (balance < amountIn) {
+    throw new PoolStop(STATUS.INSUFFICIENT_BALANCE, `${symbolOf(ctx, plan.tokenIn)} balance ${fmtFor(ctx, plan.tokenIn, balance)} < ${fmtFor(ctx, plan.tokenIn, amountIn)} needed to move the price`);
+  }
+  const routerAddr = getAddress(C.ADDRESSES.SWAP_ROUTER_02);
+  await ensureAllowance(ctx, row, plan.tokenIn, routerAddr, 'SwapRouter02', amountIn);
+  const { hash, receipt } = await sendTx(ctx, {
+    label: `fee ${row.fee}: move price to ${ctx.targetPriceLabel} (swap ≤ ${fmtFor(ctx, plan.tokenIn, amountIn)})`,
+    contract: ctx.router, method: 'exactInputSingle',
+    args: [{
+      tokenIn: plan.tokenIn, tokenOut: plan.tokenOut, fee: row.fee, recipient: ctx.address,
+      amountIn, amountOutMinimum: 0n, sqrtPriceLimitX96: ctx.targetSqrtPriceX96,
+    }],
+  });
+  row.repriceTxs.push({ step: 'move price', hash });
+  const swap = parseEvents(new Contract(row.pool, POOL_ABI).interface, receipt, row.pool).find((e) => e.name === 'Swap');
+  if (swap) {
+    const spent = getAddress(plan.tokenIn) === ctx.token0 ? swap.args.amount0 : swap.args.amount1;
+    console.log(`    swap spent ${fmtFor(ctx, plan.tokenIn, spent)}`);
+  }
+  persist(ctx, row);
+
+  ps = await readPoolState(ctx, row.pool);
+  recordPoolState(ctx, row, ps);
+  if (row.deviationPpb > C.MAX_PRICE_DEVIATION_PPB) {
+    throw new PoolStop(STATUS.FAILED, `price only reached ${row.currentPrice}; liquidity was not re-added (withdrawn funds are in the wallet). Re-run with --reprice.`);
+  }
+  row.notes.push(`repriced from ${fromPrice} to ${row.currentPrice} ${ctx.priceUnit}`);
+}
+
 async function addLiquidity(ctx, row) {
   for (const [addr, need] of [[ctx.token0, ctx.desired0], [ctx.token1, ctx.desired1]]) {
+    await wrapIfNeeded(ctx, row, addr, need);
     const bal = await tokenContract(ctx, addr).balanceOf(ctx.address);
     if (bal < need) {
-      const fmt = addr === ctx.usdcInfo.address ? fmtUsdc : fmtToken;
-      throw new PoolStop(STATUS.INSUFFICIENT_BALANCE, `${symbolOf(ctx, addr)} balance ${fmt(ctx, bal)} < ${fmt(ctx, need)} required`);
+      throw new PoolStop(STATUS.INSUFFICIENT_BALANCE, `${symbolOf(ctx, addr)} balance ${fmtFor(ctx, addr, bal)} < ${fmtFor(ctx, addr, need)} required`);
     }
   }
 
@@ -486,43 +746,46 @@ async function addLiquidity(ctx, row) {
   await ensureAllowance(ctx, row, ctx.token0, npmAddr, 'PositionManager', ctx.desired0);
   await ensureAllowance(ctx, row, ctx.token1, npmAddr, 'PositionManager', ctx.desired1);
 
-  const block = await ctx.provider.getBlock('latest');
-  const params = {
-    token0: ctx.token0,
-    token1: ctx.token1,
-    fee: row.fee,
-    tickLower: row.tickLower,
-    tickUpper: row.tickUpper,
+  const amounts = {
     amount0Desired: ctx.desired0,
     amount1Desired: ctx.desired1,
     amount0Min: applyBps(ctx.desired0, C.MINT_SLIPPAGE_BPS),
     amount1Min: applyBps(ctx.desired1, C.MINT_SLIPPAGE_BPS),
-    recipient: ctx.address,
-    deadline: BigInt(block.timestamp + C.DEADLINE_SECONDS),
+    deadline: await deadline(ctx),
   };
-  console.log(`    ticks [${row.tickLower}, ${row.tickUpper}] (spacing ${row.tickSpacing}); mins ${fmtUsdc(ctx, usdcOf(ctx, params.amount0Min, params.amount1Min))} / ${fmtToken(ctx, tokenOf(ctx, params.amount0Min, params.amount1Min))}`);
+  console.log(`    ticks [${row.tickLower}, ${row.tickUpper}] (spacing ${row.tickSpacing}); mins ${fmtQuote(ctx, quoteOf(ctx, amounts.amount0Min, amounts.amount1Min))} / ${fmtToken(ctx, tokenOf(ctx, amounts.amount0Min, amounts.amount1Min))}`);
 
-  const { hash, receipt } = await sendTx(ctx, {
-    label: `fee ${row.fee}: mint full-range position`, contract: ctx.npm, method: 'mint', args: [params],
-  });
+  // REPRICE and TOP_UP add to the deployer's existing NFT; everything else mints a new one.
+  const increasing = row.tokenId != null;
+  const { hash, receipt } = increasing
+    ? await sendTx(ctx, {
+      label: `fee ${row.fee}: add liquidity to LP NFT #${row.tokenId}`, contract: ctx.npm, method: 'increaseLiquidity',
+      args: [{ tokenId: row.tokenId, ...amounts }],
+    })
+    : await sendTx(ctx, {
+      label: `fee ${row.fee}: mint full-range position`, contract: ctx.npm, method: 'mint',
+      args: [{
+        token0: ctx.token0, token1: ctx.token1, fee: row.fee, tickLower: row.tickLower, tickUpper: row.tickUpper,
+        ...amounts, recipient: ctx.address,
+      }],
+    });
   row.mintTx = hash;
 
-  const npmLogs = receipt.logs.filter((l) => getAddress(l.address) === npmAddr);
-  const increase = npmLogs.map((l) => ctx.npm.interface.parseLog(l)).find((e) => e?.name === 'IncreaseLiquidity');
-  if (!increase) throw new Error(`mint tx ${hash} emitted no IncreaseLiquidity event`);
+  const increase = parseEvents(ctx.npm.interface, receipt, npmAddr).find((e) => e.name === 'IncreaseLiquidity');
+  if (!increase) throw new Error(`tx ${hash} emitted no IncreaseLiquidity event`);
   row.tokenId = increase.args.tokenId;
   row.positionLiquidity = increase.args.liquidity;
   row.deposited0 = increase.args.amount0;
   row.deposited1 = increase.args.amount1;
-  row.depositSource = 'mint receipt';
+  row.depositSource = increasing ? 'increaseLiquidity receipt' : 'mint receipt';
   row.swapTx = null;
   persist(ctx, row);
 
-  const usdcUsed = usdcOf(ctx, row.deposited0, row.deposited1);
+  const quoteUsed = quoteOf(ctx, row.deposited0, row.deposited1);
   const tokenUsed = tokenOf(ctx, row.deposited0, row.deposited1);
-  console.log(`    LP NFT #${row.tokenId}, liquidity ${row.positionLiquidity}`);
-  console.log(`    deposited ${fmtUsdc(ctx, usdcUsed)} + ${fmtToken(ctx, tokenUsed)}; ` +
-    `unused ${fmtUsdc(ctx, ctx.desiredUsdc - usdcUsed)} + ${fmtToken(ctx, ctx.desiredToken - tokenUsed)}`);
+  console.log(`    LP NFT #${row.tokenId}, liquidity ${increasing ? 'added ' : ''}${row.positionLiquidity}`);
+  console.log(`    deposited ${fmtQuote(ctx, quoteUsed)} + ${fmtToken(ctx, tokenUsed)}; ` +
+    `unused ${fmtQuote(ctx, ctx.desiredQuote - quoteUsed)} + ${fmtToken(ctx, ctx.desiredToken - tokenUsed)}`);
 }
 
 async function verifyPool(ctx, row) {
@@ -558,34 +821,35 @@ async function verifyPool(ctx, row) {
     row.depositSource = 'current position value (original deposit not in local record)';
   }
 
-  // Small quote: USDC -> TOKEN through this exact pool.
-  const amountIn = parseUnits(C.VERIFY_SWAP_USDC, ctx.usdcInfo.decimals);
+  // Small quote: quote token -> TOKEN through this exact pool.
+  const amountIn = parseUnits(ctx.pair.verifySwap, ctx.quoteInfo.decimals);
   const quote = await ctx.quoter.quoteExactInputSingle.staticCall({
-    tokenIn: ctx.usdcInfo.address, tokenOut: ctx.tokenInfo.address, amountIn, fee: row.fee, sqrtPriceLimitX96: 0n,
+    tokenIn: ctx.quoteInfo.address, tokenOut: ctx.tokenInfo.address, amountIn, fee: row.fee, sqrtPriceLimitX96: 0n,
   });
-  const ud = 10n ** BigInt(ctx.usdcInfo.decimals);
+  const ud = 10n ** BigInt(ctx.quoteInfo.decimals);
   const td = 10n ** BigInt(ctx.tokenInfo.decimals);
-  const { num, den } = C.TARGET_TOKEN_PER_USDC;
+  const { num, den } = ctx.pair.target;
   const expectedOut = (amountIn * num * td * (1_000_000n - BigInt(row.fee))) / (den * ud * 1_000_000n);
   const diff = quote.amountOut > expectedOut ? quote.amountOut - expectedOut : expectedOut - quote.amountOut;
   const diffBps = (diff * 10_000n) / expectedOut;
   const impact = deviationPpb(
-    tokenPerUsdcFromSqrtPrice(quote.sqrtPriceX96After, ctx.decimals),
-    tokenPerUsdcFromSqrtPrice(ps.sqrtPriceX96, ctx.decimals),
+    tokenPerQuoteFromSqrtPrice(quote.sqrtPriceX96After, ctx.decimals),
+    tokenPerQuoteFromSqrtPrice(ps.sqrtPriceX96, ctx.decimals),
   );
   check(quote.amountOut > 0n && diffBps <= C.QUOTE_TOLERANCE_BPS, `quote within ${C.QUOTE_TOLERANCE_BPS} bps of fee-adjusted target`);
-  row.verification = `quote ${C.VERIFY_SWAP_USDC} USDC → ${formatUnits(quote.amountOut, ctx.tokenInfo.decimals)} ${ctx.tokenInfo.symbol} ` +
+  row.verification = `quote ${ctx.pair.verifySwap} ${ctx.quoteInfo.symbol} → ${formatUnits(quote.amountOut, ctx.tokenInfo.decimals)} ${ctx.tokenInfo.symbol} ` +
     `(expected ≈ ${formatUnits(expectedOut, ctx.tokenInfo.decimals)}, price impact ${formatPpbAsPercent(impact)})`;
   console.log(`    ${row.verification}`);
 
   if (ctx.swapTest && !row.swapTx) {
     const routerAddr = getAddress(C.ADDRESSES.SWAP_ROUTER_02);
-    await ensureAllowance(ctx, row, ctx.usdcInfo.address, routerAddr, 'SwapRouter02', amountIn);
+    await wrapIfNeeded(ctx, row, ctx.quoteInfo.address, amountIn);
+    await ensureAllowance(ctx, row, ctx.quoteInfo.address, routerAddr, 'SwapRouter02', amountIn);
     const { hash, receipt } = await sendTx(ctx, {
-      label: `fee ${row.fee}: verification swap ${C.VERIFY_SWAP_USDC} USDC → ${ctx.tokenInfo.symbol}`,
+      label: `fee ${row.fee}: verification swap ${ctx.pair.verifySwap} ${ctx.quoteInfo.symbol} → ${ctx.tokenInfo.symbol}`,
       contract: ctx.router, method: 'exactInputSingle',
       args: [{
-        tokenIn: ctx.usdcInfo.address, tokenOut: ctx.tokenInfo.address, fee: row.fee, recipient: ctx.address,
+        tokenIn: ctx.quoteInfo.address, tokenOut: ctx.tokenInfo.address, fee: row.fee, recipient: ctx.address,
         amountIn, amountOutMinimum: applyBps(quote.amountOut, C.SWAP_SLIPPAGE_BPS), sqrtPriceLimitX96: 0n,
       }],
     });
@@ -606,17 +870,19 @@ async function verifyPool(ctx, row) {
   const failed = checks.filter((c) => !c.ok);
   for (const c of checks) console.log(`    ${c.ok ? '✓' : '✗'} ${c.what}`);
   if (failed.length) throw new PoolStop(STATUS.FAILED, `verification failed: ${failed.map((c) => c.what).join('; ')}`);
-  row.status = row.action === 'VERIFY_ONLY' ? STATUS.ALREADY_DEPLOYED : STATUS.SUCCESS;
+  row.status = { VERIFY_ONLY: STATUS.ALREADY_DEPLOYED, REPRICE: STATUS.REPRICED }[row.action] ?? STATUS.SUCCESS;
 }
 
 // ───────────────────────────── output ─────────────────────────────
 
 function summaryFields(ctx, row) {
-  const usdcDep = row.deposited0 == null ? null : usdcOf(ctx, row.deposited0, row.deposited1);
+  const quoteDep = row.deposited0 == null ? null : quoteOf(ctx, row.deposited0, row.deposited1);
   const tokenDep = row.deposited0 == null ? null : tokenOf(ctx, row.deposited0, row.deposited1);
-  const fromReceipt = row.depositSource === 'mint receipt';
-  const depositNote = row.deposited0 != null && !fromReceipt ? ' (current value)' : '';
+  const receiptAmounts = fromReceipt(row);
+  const depositNote = row.deposited0 != null && !receiptAmounts ? ' (current value)' : '';
   const approvals = row.approvals.length ? row.approvals.map((a) => `${a.token}→${a.spender}: ${a.hash}`).join('<br>') : '—';
+  const repriceTxs = row.repriceTxs.length ? row.repriceTxs.map((t) => `${t.step}: ${t.hash}`).join('<br>') : '—';
+  const Q = ctx.quoteInfo.symbol;
   return {
     'Fee tier': row.fee,
     'Fee %': feePct(row.fee),
@@ -625,18 +891,20 @@ function summaryFields(ctx, row) {
     token0: `${symbolOf(ctx, ctx.token0)} ${ctx.token0}`,
     token1: `${symbolOf(ctx, ctx.token1)} ${ctx.token1}`,
     'Target price': ctx.targetPriceLabel,
-    'Current price': row.currentPrice ? `${row.currentPrice} ${ctx.tokenInfo.symbol}/USDC` : '—',
+    'Current price': row.currentPrice ? `${row.currentPrice} ${ctx.priceUnit}` : '—',
     sqrtPriceX96: row.sqrtPriceX96?.toString() ?? '—',
     'Current tick': row.tick ?? '—',
     'Pool liquidity': row.liquidity?.toString() ?? '—',
     'LP NFT tokenId': row.tokenId?.toString() ?? '—',
-    'USDC deposited': usdcDep == null ? '—' : fmtUsdc(ctx, usdcDep) + depositNote,
+    [`${Q} deposited`]: quoteDep == null ? '—' : fmtQuote(ctx, quoteDep) + depositNote,
     'TOKEN deposited': tokenDep == null ? '—' : fmtToken(ctx, tokenDep) + depositNote,
-    'Unused USDC': fromReceipt ? fmtUsdc(ctx, ctx.desiredUsdc - usdcDep) : '—',
-    'Unused TOKEN': fromReceipt ? fmtToken(ctx, ctx.desiredToken - tokenDep) : '—',
+    [`Unused ${Q}`]: receiptAmounts ? fmtQuote(ctx, ctx.desiredQuote - quoteDep) : '—',
+    'Unused TOKEN': receiptAmounts ? fmtToken(ctx, ctx.desiredToken - tokenDep) : '—',
     'Init tx': row.initTx ?? (row.pool ? 'n/a (pool pre-existed or not recorded)' : '—'),
+    'Reprice txs': repriceTxs,
+    ...(ctx.pair.wrapNative ? { 'Wrap txs': row.wrapTxs.length ? row.wrapTxs.join('<br>') : '—' } : {}),
     'Approval txs': approvals,
-    'Mint tx': row.mintTx ?? '—',
+    'Mint/increase tx': row.mintTx ?? '—',
     Verification: row.verification ?? '—',
     Status: row.status,
     Notes: [...row.notes, row.error].filter(Boolean).join('; ') || '—',
@@ -645,11 +913,11 @@ function summaryFields(ctx, row) {
 
 function printSummary(ctx, rows) {
   console.log('\n════════════════════════════ SUMMARY ════════════════════════════');
-  const cols = ['Fee', 'Pool', 'Spacing', `Price (${ctx.tokenInfo.symbol}/USDC)`, 'Tick', 'NFT', 'USDC dep.', 'TOKEN dep.', 'Status'];
+  const cols = ['Fee', 'Pool', 'Spacing', `Price (${ctx.priceUnit})`, 'Tick', 'NFT', `${ctx.quoteInfo.symbol} dep.`, 'TOKEN dep.', 'Status'];
   const table = rows.map((r) => {
     const f = summaryFields(ctx, r);
     return [feePct(r.fee), r.pool ?? '—', String(f['Tick spacing']), r.currentPrice ?? '—', String(f['Current tick']),
-      f['LP NFT tokenId'], f['USDC deposited'].replace(/ \(current value\)$/, '*'), f['TOKEN deposited'].replace(/ \(current value\)$/, '*'), r.status];
+      f['LP NFT tokenId'], f[`${ctx.quoteInfo.symbol} deposited`].replace(/ \(current value\)$/, '*'), f['TOKEN deposited'].replace(/ \(current value\)$/, '*'), r.status];
   });
   const widths = cols.map((c, i) => Math.max(c.length, ...table.map((t) => t[i].length)));
   const fmtRow = (cells) => cells.map((c, i) => c.padEnd(widths[i])).join('  ');
@@ -669,14 +937,14 @@ function writeSummaryFile(ctx, rows) {
   const headers = Object.keys(fields[0]);
   const esc = (v) => String(v).replaceAll('|', '\\|');
   const lines = [
-    '# Uniswap V3 USDC/TOKEN deployment — Ethereum Sepolia',
+    `# Uniswap V3 ${ctx.quoteInfo.symbol}/TOKEN deployment — Ethereum Sepolia`,
     '',
     `Generated ${new Date().toISOString()} by \`scripts/deploy-pools.mjs\`.`,
     '',
     `- Deployer: \`${ctx.address}\``,
-    `- USDC: \`${ctx.usdcInfo.address}\` (${ctx.usdcInfo.decimals} decimals)`,
+    `- Quote: \`${ctx.quoteInfo.address}\` (${ctx.quoteInfo.symbol}, ${ctx.quoteInfo.decimals} decimals)`,
     `- TOKEN: \`${ctx.tokenInfo.address}\` (${ctx.tokenInfo.symbol}, ${ctx.tokenInfo.decimals} decimals)`,
-    `- Target: ${ctx.targetPriceLabel} · per pool ${C.LIQUIDITY_PER_POOL.USDC} USDC + ${C.LIQUIDITY_PER_POOL.TOKEN} TOKEN, full range`,
+    `- Target: ${ctx.targetPriceLabel} · per pool ${ctx.pair.liquidity.quote} ${ctx.quoteInfo.symbol} + ${ctx.pair.liquidity.token} TOKEN, full range`,
     `- Target sqrtPriceX96: \`${ctx.targetSqrtPriceX96}\``,
     '',
     `| ${headers.join(' | ')} |`,
@@ -692,8 +960,10 @@ function writeSummaryFile(ctx, rows) {
 
 async function main() {
   installRedaction();
-  const { dryRun, swapTest } = parseArgs();
+  const { dryRun, swapTest, reprice, pairKey } = parseArgs();
+  const pair = C.PAIRS[pairKey];
   loadDotEnv();
+  setOutputPaths(pair);
 
   const rpcUrl = process.env.SEPOLIA_RPC_URL?.trim() || C.DEFAULT_RPC_URL;
   // cacheTimeout -1: every read hits the node (ethers otherwise reuses identical requests for 250ms).
@@ -705,40 +975,43 @@ async function main() {
   console.log(`Network: Sepolia (chainId ${C.SEPOLIA_CHAIN_ID}) via ${new URL(rpcUrl).host}${dryRun ? '  [DRY RUN: no transactions]' : ''}`);
 
   const ctx = {
-    provider, wallet, address, dryRun, swapTest,
-    usdc: new Contract(C.ADDRESSES.USDC, ERC20_ABI, wallet),
+    provider, wallet, address, dryRun, swapTest, reprice, pair,
+    quote: new Contract(pair.quote, pair.wrapNative ? WETH9_ABI : ERC20_ABI, wallet),
     token: new Contract(C.ADDRESSES.TOKEN, ERC20_ABI, wallet),
     factory: new Contract(C.ADDRESSES.FACTORY, FACTORY_ABI, provider),
     npm: new Contract(C.ADDRESSES.POSITION_MANAGER, POSITION_MANAGER_ABI, wallet),
     quoter: new Contract(C.ADDRESSES.QUOTER_V2, QUOTER_V2_ABI, provider),
     router: new Contract(C.ADDRESSES.SWAP_ROUTER_02, SWAP_ROUTER_02_ABI, wallet),
-    allowedTargets: new Set([C.ADDRESSES.USDC, C.ADDRESSES.TOKEN, C.ADDRESSES.POSITION_MANAGER, C.ADDRESSES.SWAP_ROUTER_02].map(getAddress)),
+    allowedTargets: new Set([pair.quote, C.ADDRESSES.TOKEN, C.ADDRESSES.POSITION_MANAGER, C.ADDRESSES.SWAP_ROUTER_02].map(getAddress)),
   };
 
   await verifyContracts(ctx);
-  ctx.usdcInfo = await readTokenInfo(ctx.usdc, 'USDC');
+  ctx.quoteInfo = await readTokenInfo(ctx.quote, 'QUOTE');
   ctx.tokenInfo = await readTokenInfo(ctx.token, 'TOKEN');
-  [ctx.token0, ctx.token1] = sortTokens(ctx.usdcInfo.address, ctx.tokenInfo.address).map(getAddress);
-  ctx.usdcIsToken0 = ctx.token0 === ctx.usdcInfo.address;
-  ctx.decimals = { usdcIsToken0: ctx.usdcIsToken0, usdcDecimals: ctx.usdcInfo.decimals, tokenDecimals: ctx.tokenInfo.decimals };
+  [ctx.token0, ctx.token1] = sortTokens(ctx.quoteInfo.address, ctx.tokenInfo.address).map(getAddress);
+  ctx.quoteIsToken0 = ctx.token0 === ctx.quoteInfo.address;
+  ctx.decimals = { quoteIsToken0: ctx.quoteIsToken0, quoteDecimals: ctx.quoteInfo.decimals, tokenDecimals: ctx.tokenInfo.decimals };
 
   // Per-pool amounts in raw units, and a guard that they encode the same price as the target.
-  ctx.desiredUsdc = parseUnits(C.LIQUIDITY_PER_POOL.USDC, ctx.usdcInfo.decimals);
-  ctx.desiredToken = parseUnits(C.LIQUIDITY_PER_POOL.TOKEN, ctx.tokenInfo.decimals);
-  const { num, den } = C.TARGET_TOKEN_PER_USDC;
-  if (ctx.desiredToken * 10n ** BigInt(ctx.usdcInfo.decimals) * den !== ctx.desiredUsdc * 10n ** BigInt(ctx.tokenInfo.decimals) * num) {
-    throw new DeploymentAbort('LIQUIDITY_PER_POOL does not match TARGET_TOKEN_PER_USDC');
+  ctx.desiredQuote = parseUnits(ctx.pair.liquidity.quote, ctx.quoteInfo.decimals);
+  ctx.desiredToken = parseUnits(ctx.pair.liquidity.token, ctx.tokenInfo.decimals);
+  const { num, den } = ctx.pair.target;
+  if (ctx.desiredToken * 10n ** BigInt(ctx.quoteInfo.decimals) * den !== ctx.desiredQuote * 10n ** BigInt(ctx.tokenInfo.decimals) * num) {
+    throw new DeploymentAbort(`PAIRS.${pairKey}.liquidity does not match PAIRS.${pairKey}.target`);
   }
-  ctx.desired0 = ctx.usdcIsToken0 ? ctx.desiredUsdc : ctx.desiredToken;
-  ctx.desired1 = ctx.usdcIsToken0 ? ctx.desiredToken : ctx.desiredUsdc;
-  const ratio = targetRawRatio({ ...ctx.decimals, target: C.TARGET_TOKEN_PER_USDC });
+  ctx.desired0 = ctx.quoteIsToken0 ? ctx.desiredQuote : ctx.desiredToken;
+  ctx.desired1 = ctx.quoteIsToken0 ? ctx.desiredToken : ctx.desiredQuote;
+  const ratio = targetRawRatio({ ...ctx.decimals, target: ctx.pair.target });
   ctx.targetSqrtPriceX96 = encodeSqrtPriceX96(ratio.amount1, ratio.amount0);
-  ctx.targetPriceLabel = `${formatRational(C.TARGET_TOKEN_PER_USDC, 0)} ${ctx.tokenInfo.symbol}/USDC`;
+  ctx.priceUnit = `${ctx.tokenInfo.symbol}/${ctx.quoteInfo.symbol}`;
+  ctx.targetPriceLabel = `${formatRational(ctx.pair.target, 0)} ${ctx.priceUnit}`;
+  ctx.targetKey = `${num}/${den}`;
 
-  console.log(`USDC:  ${ctx.usdcInfo.address} (${ctx.usdcInfo.symbol}, ${ctx.usdcInfo.decimals} decimals)`);
+  console.log(`Pair: ${pairKey}`);
+  console.log(`Quote: ${ctx.quoteInfo.address} (${ctx.quoteInfo.symbol}, ${ctx.quoteInfo.decimals} decimals)`);
   console.log(`TOKEN: ${ctx.tokenInfo.address} (${ctx.tokenInfo.symbol}, ${ctx.tokenInfo.decimals} decimals)`);
   console.log(`token0 = ${symbolOf(ctx, ctx.token0)}, token1 = ${symbolOf(ctx, ctx.token1)}`);
-  console.log(`Target 1 USDC = ${ctx.targetPriceLabel.split(' ')[0]} ${ctx.tokenInfo.symbol}; raw token1/token0 = ${ratio.amount1}/${ratio.amount0}; sqrtPriceX96 = ${ctx.targetSqrtPriceX96}`);
+  console.log(`Target 1 ${ctx.quoteInfo.symbol} = ${ctx.targetPriceLabel.split(' ')[0]} ${ctx.tokenInfo.symbol}; raw token1/token0 = ${ratio.amount1}/${ratio.amount0}; sqrtPriceX96 = ${ctx.targetSqrtPriceX96}`);
   console.log(`ETH balance: ${formatEther(await provider.getBalance(address))} ETH`);
 
   ctx.state = loadState(ctx);
@@ -746,12 +1019,13 @@ async function main() {
   console.log('\nInspecting fee tiers…');
   const positions = await walletPositions(ctx);
   const rows = [];
-  for (const fee of C.FEE_TIERS) {
+  for (const fee of ctx.pair.feeTiers) {
     const row = await planPool(ctx, fee, positions);
     rows.push(row);
     const where = row.pool ? `pool ${row.pool}` : 'no pool yet';
     const what = row.status ? `${row.status}: ${row.error}` : ACTION_TEXT[row.action];
     console.log(`  fee ${String(fee).padEnd(5)} spacing ${String(row.tickSpacing ?? '?').padEnd(3)} ${where} → ${what}`);
+    if (row.action === 'REPRICE') console.log(`      reprice ${describeReprice(ctx, row)}`);
   }
 
   const shortfalls = await preflight(ctx, rows);
@@ -804,7 +1078,7 @@ async function main() {
   writeSummaryFile(ctx, rows);
   console.log(`\nSaved ${path.relative(ROOT, SUMMARY_FILE)} and ${path.relative(ROOT, STATE_FILE)}`);
 
-  const complete = rows.every((r) => r.status === STATUS.SUCCESS || r.status === STATUS.ALREADY_DEPLOYED);
+  const complete = rows.every((r) => DONE_STATUSES.has(r.status));
   console.log(complete ? 'All four fee-tier pools are deployed and verified.' : 'Deployment incomplete; see statuses above.');
   return complete ? 0 : 1;
 }

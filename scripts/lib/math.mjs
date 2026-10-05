@@ -32,13 +32,13 @@ export function sortTokens(a, b) {
 
 /**
  * Raw token0/token1 amounts that express the target human price, honouring actual
- * token ordering and decimals. `target` is TOKEN-per-USDC as {num, den}:
- * `den` USDC trades for `num` TOKEN.
+ * token ordering and decimals. `target` is TOKEN-per-quote-token as {num, den}:
+ * `den` quote tokens trade for `num` TOKEN.
  */
-export function targetRawRatio({ usdcIsToken0, usdcDecimals, tokenDecimals, target }) {
-  const usdcRaw = target.den * 10n ** BigInt(usdcDecimals);
+export function targetRawRatio({ quoteIsToken0, quoteDecimals, tokenDecimals, target }) {
+  const quoteRaw = target.den * 10n ** BigInt(quoteDecimals);
   const tokenRaw = target.num * 10n ** BigInt(tokenDecimals);
-  return usdcIsToken0 ? { amount0: usdcRaw, amount1: tokenRaw } : { amount0: tokenRaw, amount1: usdcRaw };
+  return quoteIsToken0 ? { amount0: quoteRaw, amount1: tokenRaw } : { amount0: tokenRaw, amount1: quoteRaw };
 }
 
 /** sqrtPriceX96 = floor(sqrt(amount1 / amount0) * 2^96), computed exactly. */
@@ -52,15 +52,15 @@ export function encodeSqrtPriceX96(amount1, amount0) {
   return sqrtPriceX96;
 }
 
-/** Pool sqrtPriceX96 -> TOKEN per USDC (human units) as an exact rational. */
-export function tokenPerUsdcFromSqrtPrice(sqrtPriceX96, { usdcIsToken0, usdcDecimals, tokenDecimals }) {
+/** Pool sqrtPriceX96 -> TOKEN per quote token (human units) as an exact rational. */
+export function tokenPerQuoteFromSqrtPrice(sqrtPriceX96, { quoteIsToken0, quoteDecimals, tokenDecimals }) {
   // price(token1/token0) in raw units = sqrtPriceX96^2 / 2^192
   const p2 = sqrtPriceX96 * sqrtPriceX96;
-  const ud = 10n ** BigInt(usdcDecimals);
+  const ud = 10n ** BigInt(quoteDecimals);
   const td = 10n ** BigInt(tokenDecimals);
-  return usdcIsToken0
-    ? { num: p2 * ud, den: Q192 * td } //  TOKEN raw per USDC raw  -> rescale
-    : { num: Q192 * ud, den: p2 * td }; // USDC raw per TOKEN raw  -> invert, rescale
+  return quoteIsToken0
+    ? { num: p2 * ud, den: Q192 * td } //  TOKEN raw per quote raw  -> rescale
+    : { num: Q192 * ud, den: p2 * td }; // quote raw per TOKEN raw  -> invert, rescale
 }
 
 /** |current - target| / target, in parts per billion (1% = 10,000,000). */
@@ -87,6 +87,20 @@ export function fullRangeTicks(tickSpacing) {
   const tickLower = Math.ceil(MIN_TICK / tickSpacing) * tickSpacing;
   const tickUpper = Math.floor(MAX_TICK / tickSpacing) * tickSpacing;
   return { tickLower, tickUpper };
+}
+
+const ceilDiv = (a, b) => (a + b - 1n) / b;
+
+/**
+ * Input (including the LP fee, rounded up) a swap needs to move a pool with active liquidity `liquidity`
+ * from sqrtCurrentX96 to sqrtTargetX96, assuming no initialized tick lies in between.
+ */
+export function priceMoveInput(liquidity, sqrtCurrentX96, sqrtTargetX96, fee) {
+  const zeroForOne = sqrtTargetX96 < sqrtCurrentX96;
+  const amount = zeroForOne
+    ? ceilDiv(liquidity * (sqrtCurrentX96 - sqrtTargetX96) * Q96, sqrtCurrentX96 * sqrtTargetX96) // token0 in
+    : ceilDiv(liquidity * (sqrtTargetX96 - sqrtCurrentX96), Q96); // token1 in
+  return { zeroForOne, amountIn: ceilDiv(amount * 1_000_000n, 1_000_000n - BigInt(fee)) };
 }
 
 export function applyBps(amount, bpsOff) {
